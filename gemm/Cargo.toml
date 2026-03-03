@@ -24,10 +24,12 @@ gemm-c32 = { version = "0.19.0", path = "../gemm-c32", default-features = false 
 gemm-c64 = { version = "0.19.0", path = "../gemm-c64", default-features = false }
 
 gemm-f16 = { version = "0.19.0", path = "../gemm-f16", default-features = false, optional = true }
+gemm-bf16 = { version = "0.19.0", path = "../gemm-bf16", default-features = false, optional = true }
 
 [features]
 default = ["std", "rayon", "f16"]
 f16 = ["gemm-f16", "gemm-common/f16"]
+bf16 = ["gemm-bf16", "gemm-common/bf16"]
 std = [
   "dyn-stack/std",
   "gemm-common/std",
@@ -36,6 +38,7 @@ std = [
   "gemm-c32/std",
   "gemm-c64/std",
   "gemm-f16?/std",
+  "gemm-bf16?/std",
 ]
 x86-v4 = [
   "gemm-common/x86-v4",
@@ -44,6 +47,7 @@ x86-v4 = [
   "gemm-c32/x86-v4",
   "gemm-c64/x86-v4",
   "gemm-f16?/x86-v4",
+  "gemm-bf16?/x86-v4",
 ]
 experimental-apple-amx = [
     "gemm-common/experimental-apple-amx",
@@ -52,6 +56,7 @@ experimental-apple-amx = [
     "gemm-c32/experimental-apple-amx",
     "gemm-c64/experimental-apple-amx",
     "gemm-f16?/experimental-apple-amx",
+    "gemm-bf16?/experimental-apple-amx",
 ]
 rayon = [
   "std",
@@ -61,6 +66,7 @@ rayon = [
   "gemm-c32/rayon",
   "gemm-c64/rayon",
   "gemm-f16?/rayon",
+  "gemm-bf16?/rayon",
 ]
 wasm-simd128-enable = ["gemm-common/wasm-simd128-enable"]
 

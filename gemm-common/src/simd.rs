@@ -1,6 +1,8 @@
 pub use bytemuck::Pod;
 #[cfg(feature = "f16")]
 use half::f16;
+#[cfg(feature = "bf16")]
+use half::bf16;
 pub use pulp::{cast, NullaryFnOnce};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -102,6 +104,101 @@ unsafe impl MixedSimd<f16, f16, f16, f32> for Scalar {
     #[inline(always)]
     fn simd_into_dst(self, acc: Self::AccN) -> Self::DstN {
         f16::from_f32(acc)
+    }
+
+    #[inline(always)]
+    fn vectorize<F: NullaryFnOnce>(self, f: F) -> F::Output {
+        f.call()
+    }
+
+    #[inline(always)]
+    fn simd_mul(self, lhs: Self::AccN, rhs: Self::AccN) -> Self::AccN {
+        lhs * rhs
+    }
+
+    #[inline(always)]
+    fn simd_add(self, lhs: Self::AccN, rhs: Self::AccN) -> Self::AccN {
+        lhs + rhs
+    }
+}
+
+#[cfg(feature = "bf16")]
+unsafe impl MixedSimd<bf16, bf16, bf16, f32> for Scalar {
+    const SIMD_WIDTH: usize = 1;
+
+    type LhsN = bf16;
+    type RhsN = bf16;
+    type DstN = bf16;
+    type AccN = f32;
+
+    #[inline]
+    fn try_new() -> Option<Self> {
+        Some(Self)
+    }
+
+    #[inline(always)]
+    fn add(self, lhs: f32, rhs: f32) -> f32 {
+        lhs + rhs
+    }
+
+    #[inline(always)]
+    fn mult(self, lhs: f32, rhs: f32) -> f32 {
+        lhs * rhs
+    }
+
+    #[inline(always)]
+    fn mult_add(self, lhs: f32, rhs: f32, acc: f32) -> f32 {
+        lhs * rhs + acc
+    }
+
+    #[inline(always)]
+    fn from_lhs(self, lhs: bf16) -> f32 {
+        lhs.to_f32()
+    }
+
+    #[inline(always)]
+    fn from_rhs(self, rhs: bf16) -> f32 {
+        rhs.to_f32()
+    }
+
+    #[inline(always)]
+    fn from_dst(self, dst: bf16) -> f32 {
+        dst.to_f32()
+    }
+
+    #[inline(always)]
+    fn into_dst(self, acc: f32) -> bf16 {
+        bf16::from_f32(acc)
+    }
+
+    #[inline(always)]
+    fn simd_mult_add(self, lhs: Self::AccN, rhs: Self::AccN, acc: Self::AccN) -> Self::AccN {
+        lhs * rhs + acc
+    }
+
+    #[inline(always)]
+    fn simd_from_lhs(self, lhs: Self::LhsN) -> Self::AccN {
+        lhs.to_f32()
+    }
+
+    #[inline(always)]
+    fn simd_from_rhs(self, rhs: Self::RhsN) -> Self::AccN {
+        rhs.to_f32()
+    }
+
+    #[inline(always)]
+    fn simd_splat(self, lhs: f32) -> Self::AccN {
+        lhs
+    }
+
+    #[inline(always)]
+    fn simd_from_dst(self, dst: Self::DstN) -> Self::AccN {
+        dst.to_f32()
+    }
+
+    #[inline(always)]
+    fn simd_into_dst(self, acc: Self::AccN) -> Self::DstN {
+        bf16::from_f32(acc)
     }
 
     #[inline(always)]
@@ -503,6 +600,9 @@ mod x86 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    // Explicit import to disambiguate from core::arch::x86_64::bf16
+    #[cfg(feature = "bf16")]
+    use half::bf16;
 
     #[inline(always)]
     pub unsafe fn v3_fmaf(a: f32, b: f32, c: f32) -> f32 {
@@ -834,6 +934,124 @@ mod x86 {
         #[inline(always)]
         fn add(self, lhs: f32, rhs: f32) -> f32 {
             lhs + rhs
+        }
+
+        #[inline(always)]
+        fn simd_mul(self, lhs: Self::AccN, rhs: Self::AccN) -> Self::AccN {
+            cast(self.avx._mm256_mul_ps(cast(lhs), cast(rhs)))
+        }
+
+        #[inline(always)]
+        fn simd_add(self, lhs: Self::AccN, rhs: Self::AccN) -> Self::AccN {
+            cast(self.avx._mm256_add_ps(cast(lhs), cast(rhs)))
+        }
+    }
+
+    #[cfg(feature = "bf16")]
+    unsafe impl MixedSimd<bf16, bf16, bf16, f32> for V3 {
+        const SIMD_WIDTH: usize = 8;
+
+        type LhsN = [bf16; 8];
+        type RhsN = [bf16; 8];
+        type DstN = [bf16; 8];
+        type AccN = [f32; 8];
+
+        #[inline]
+        fn try_new() -> Option<Self> {
+            Self::try_new()
+        }
+
+        #[inline(always)]
+        fn add(self, lhs: f32, rhs: f32) -> f32 {
+            lhs + rhs
+        }
+
+        #[inline(always)]
+        fn mult(self, lhs: f32, rhs: f32) -> f32 {
+            lhs * rhs
+        }
+
+        #[inline(always)]
+        fn mult_add(self, lhs: f32, rhs: f32, acc: f32) -> f32 {
+            unsafe { v3_fmaf(lhs, rhs, acc) }
+        }
+
+        #[inline(always)]
+        fn from_lhs(self, lhs: bf16) -> f32 {
+            lhs.to_f32()
+        }
+
+        #[inline(always)]
+        fn from_rhs(self, rhs: bf16) -> f32 {
+            rhs.to_f32()
+        }
+
+        #[inline(always)]
+        fn from_dst(self, dst: bf16) -> f32 {
+            dst.to_f32()
+        }
+
+        #[inline(always)]
+        fn into_dst(self, acc: f32) -> bf16 {
+            bf16::from_f32(acc)
+        }
+
+        #[inline(always)]
+        fn simd_mult_add(self, lhs: Self::AccN, rhs: Self::AccN, acc: Self::AccN) -> Self::AccN {
+            cast(self.fma._mm256_fmadd_ps(cast(lhs), cast(rhs), cast(acc)))
+        }
+
+        #[inline(always)]
+        fn simd_from_lhs(self, lhs: Self::LhsN) -> Self::AccN {
+            // bf16->f32: zero-extend 8xu16 to 8xu32, shift left 16 to put bits in f32 position
+            unsafe {
+                cast(_mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_cvtepu16_epi32(cast(lhs)),
+                    16,
+                )))
+            }
+        }
+
+        #[inline(always)]
+        fn simd_from_rhs(self, rhs: Self::RhsN) -> Self::AccN {
+            unsafe {
+                cast(_mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_cvtepu16_epi32(cast(rhs)),
+                    16,
+                )))
+            }
+        }
+
+        #[inline(always)]
+        fn simd_splat(self, lhs: f32) -> Self::AccN {
+            cast(self.avx._mm256_set1_ps(lhs))
+        }
+
+        #[inline(always)]
+        fn simd_from_dst(self, dst: Self::DstN) -> Self::AccN {
+            unsafe {
+                cast(_mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_cvtepu16_epi32(cast(dst)),
+                    16,
+                )))
+            }
+        }
+
+        #[inline(always)]
+        fn simd_into_dst(self, acc: Self::AccN) -> Self::DstN {
+            // f32->bf16: keep upper 16 bits of each f32 lane, pack to [bf16;8]
+            unsafe {
+                let u32s = _mm256_castps_si256(cast(acc));
+                let shifted = _mm256_srli_epi32(u32s, 16);
+                let lo = _mm256_castsi256_si128(shifted);
+                let hi = _mm256_extracti128_si256::<1>(shifted);
+                cast(_mm_packus_epi32(lo, hi))
+            }
+        }
+
+        #[inline(always)]
+        fn vectorize<F: NullaryFnOnce>(self, f: F) -> F::Output {
+            self.vectorize(f)
         }
 
         #[inline(always)]

@@ -103,14 +103,14 @@ fn args() -> Vec<List![Parallelism, Layout, Layout, Layout, usize, usize, usize]
 // =============================================================================
 // BF16 comparison benchmarks
 //
-// These benchmarks compare native bf16 GEMM against the naive approach of
-// upcasting bf16 tensors to f32 before every matmul.
+// These benchmarks compare mixed-precision bf16 GEMM against the naive approach
+// of upcasting bf16 tensors to f32 before every matmul.
 // =============================================================================
 
-/// BF16 GEMM: reads bf16, converts to f32 during packing, computes in f32.
+/// Mixed-precision BF16 GEMM: reads bf16, converts to f32 during packing, computes in f32.
 /// Avoids allocating temporary f32 tensors.
 #[cfg(feature = "bf16")]
-fn bench_bf16_native(
+fn bench_bf16_mixed(
     bencher: Bencher,
     list![m, n, k]: List![usize, usize, usize],
 ) {
@@ -137,7 +137,7 @@ fn bench_bf16_native(
 }
 
 /// Naive approach: allocate f32 tensors, upcast bf16→f32, then run f32 GEMM.
-/// This is what frameworks like candle did before native bf16 GEMM support.
+/// This is what frameworks like candle did before mixed-precision bf16 GEMM support.
 #[cfg(feature = "bf16")]
 fn bench_bf16_upcast(
     bencher: Bencher,
@@ -258,11 +258,11 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // BF16 comparison: native bf16 GEMM vs naive upcast approach
+    // BF16 comparison: mixed-precision bf16 GEMM vs naive upcast approach
     #[cfg(feature = "bf16")]
     {
         let mut bench = Bench::new(&config);
-        bench.register(bench_bf16_native, bf16_args());
+        bench.register(bench_bf16_mixed, bf16_args());
         bench.register(bench_bf16_upcast, bf16_args());
         bench.run().unwrap();
     }

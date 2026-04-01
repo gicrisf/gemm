@@ -8,6 +8,10 @@ pub use crate::gemm::f16;
 #[cfg(feature = "bf16")]
 pub use crate::gemm::bf16;
 pub use crate::gemm::{c32, c64, gemm};
+pub use crate::gemm::{
+    PackedRhsInfo, packed_rhs_size, packed_rhs_alignment,
+    packed_rhs_size_f32, prepack_rhs_f32, gemm_prepacked_rhs_f32,
+};
 pub use gemm_common::Parallelism;
 
 pub use gemm_common::gemm::{
@@ -720,6 +724,119 @@ mod tests {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gemm_prepacked_f32() {
+        use crate::{
+            packed_rhs_size_f32, prepack_rhs_f32, gemm_prepacked_rhs_f32,
+            packed_rhs_alignment,
+        };
+
+        let mut mnks = vec![];
+        mnks.push((4, 4, 4));
+        mnks.push((64, 64, 64));
+        mnks.push((63, 63, 63));
+        mnks.push((128, 256, 64));
+        mnks.push((256, 128, 64));
+        mnks.push((16, 16, 1));
+        mnks.push((16, 16, 2));
+        mnks.push((1, 1, 1));
+        mnks.push((1, 64, 64));
+        mnks.push((64, 1, 64));
+        mnks.push((64, 64, 1));
+
+        for (m, n, k) in mnks {
+            #[cfg(feature = "std")]
+            dbg!(m, n, k);
+
+            for parallelism in [
+                Parallelism::None,
+                #[cfg(feature = "rayon")]
+                Parallelism::Rayon(0),
+            ] {
+                for alpha in [0.0f32, 1.0, 2.3] {
+                    for beta in [0.0f32, 1.0, 2.3] {
+                        #[cfg(feature = "std")]
+                        dbg!(alpha, beta, parallelism);
+
+                        // Create test matrices
+                        let a_vec: Vec<f32> = (0..(m * k)).map(|_| rand::random()).collect();
+                        let b_vec: Vec<f32> = (0..(k * n)).map(|_| rand::random()).collect();
+                        let mut c_vec: Vec<f32> = (0..(m * n)).map(|_| rand::random()).collect();
+                        let mut d_vec = c_vec.clone();
+
+                        // Pre-pack RHS
+                        let (info, packed_size_bytes) = packed_rhs_size_f32(k, n);
+                        let align = packed_rhs_alignment();
+                        let layout = std::alloc::Layout::from_size_align(packed_size_bytes, align).unwrap();
+                        let packed_rhs = unsafe { std::alloc::alloc(layout) as *mut f32 };
+
+                        unsafe {
+                            prepack_rhs_f32(
+                                packed_rhs,
+                                b_vec.as_ptr(),
+                                k as isize,  // row stride (column-major)
+                                1,           // column stride
+                                &info,
+                            );
+
+                            // Test prepacked GEMM
+                            gemm_prepacked_rhs_f32(
+                                m,
+                                n,
+                                k,
+                                c_vec.as_mut_ptr(),
+                                m as isize,  // column stride (column-major)
+                                1,           // row stride
+                                true,
+                                a_vec.as_ptr(),
+                                m as isize,  // column stride
+                                1,           // row stride
+                                packed_rhs,
+                                &info,
+                                alpha,
+                                beta,
+                                parallelism,
+                            );
+
+                            // Reference: regular GEMM
+                            gemm::gemm(
+                                m,
+                                n,
+                                k,
+                                d_vec.as_mut_ptr(),
+                                m as isize,
+                                1,
+                                true,
+                                a_vec.as_ptr(),
+                                m as isize,
+                                1,
+                                b_vec.as_ptr(),
+                                k as isize,
+                                1,
+                                alpha,
+                                beta,
+                                false,
+                                false,
+                                false,
+                                parallelism,
+                            );
+
+                            std::alloc::dealloc(packed_rhs as *mut u8, layout);
+                        }
+
+                        // Compare results
+                        for (i, (c, d)) in c_vec.iter().zip(d_vec.iter()).enumerate() {
+                            assert_approx_eq::assert_approx_eq!(c, d, 1e-4,
+                                "mismatch at index {} for m={}, n={}, k={}, alpha={}, beta={}",
+                                i, m, n, k, alpha, beta
+                            );
                         }
                     }
                 }

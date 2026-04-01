@@ -3,6 +3,7 @@ use crate::{
     gemv, gevv,
     microkernel::{HMicroKernelFn, MicroKernelFn},
     pack_operands::{pack_lhs, pack_rhs},
+    prepack::PackedRhsInfo,
     simd::MixedSimd,
     Parallelism, Ptr,
 };
@@ -845,6 +846,744 @@ pub unsafe fn gemm_basic_generic<
         }
         col_outer += n_chunk;
     }
+}
+
+/// Pre-pack the RHS matrix for later use with `gemm_with_prepacked_rhs_generic`.
+///
+/// # Safety
+///
+/// - `dst` must be valid for writes of `info.packed_size` elements
+/// - `src` must be valid for reads according to dimensions and strides
+/// - `info` must have been computed with matching `nr` parameter
+#[inline(always)]
+pub unsafe fn prepack_rhs_generic<
+    S: MixedSimd<T, T, T, T>,
+    T: Copy + Send + Sync + 'static,
+    const N: usize,
+    const NR: usize,
+>(
+    simd: S,
+    info: &PackedRhsInfo,
+    dst: *mut T,
+    src: *const T,
+    src_rs: isize,
+    src_cs: isize,
+) {
+    let PackedRhsInfo { k, n, kc, nr, .. } = *info;
+    debug_assert_eq!(nr, NR);
+
+    let packed_rhs_stride = kc * NR;
+    let n_panels = n.msrv_div_ceil(NR);
+
+    let mut depth = 0;
+    let mut k_panel_idx = 0;
+    while depth < k {
+        let k_chunk = kc.min(k - depth);
+
+        // Pack all column panels for this k-chunk
+        pack_rhs::<T, N, NR, S>(
+            simd,
+            n,
+            k_chunk,
+            Ptr(dst.add(k_panel_idx * n_panels * packed_rhs_stride)),
+            Ptr(src.offset(depth as isize * src_rs) as *mut T),
+            src_cs,
+            src_rs,
+            packed_rhs_stride,
+        );
+
+        depth += k_chunk;
+        k_panel_idx += 1;
+    }
+}
+
+/// Perform GEMM using a pre-packed RHS matrix.
+///
+/// This function is similar to `gemm_basic_generic` but uses a pre-packed RHS matrix
+/// instead of packing the RHS on-the-fly. This is useful when the same RHS matrix
+/// is reused across multiple GEMM calls (e.g., weight matrices in neural networks).
+///
+/// # Safety
+///
+/// - All pointer parameters must be valid for their respective dimensions and strides
+/// - `packed_rhs` must have been packed using `prepack_rhs_generic` with matching parameters
+/// - `packed_rhs_info` must describe the packed buffer accurately
+#[inline(always)]
+pub unsafe fn gemm_with_prepacked_rhs_generic<
+    S: MixedSimd<T, T, T, T>,
+    T: Copy
+        + num_traits::Zero
+        + num_traits::One
+        + Conj
+        + Send
+        + Sync
+        + core::fmt::Debug
+        + core::ops::Add<Output = T>
+        + core::ops::Mul<Output = T>
+        + core::cmp::PartialEq
+        + 'static,
+    const N: usize,
+    const MR: usize,
+    const NR: usize,
+    const MR_DIV_N: usize,
+>(
+    simd: S,
+    m: usize,
+    n: usize,
+    k: usize,
+    dst: *mut T,
+    dst_cs: isize,
+    dst_rs: isize,
+    read_dst: bool,
+    lhs: *const T,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    packed_rhs: *const T,
+    packed_rhs_info: &PackedRhsInfo,
+    mut alpha: T,
+    beta: T,
+    _mul_add: impl Copy + Fn(T, T, T) -> T,
+    dispatcher: &[[MicroKernelFn<T>; NR]; MR_DIV_N],
+    parallelism: Parallelism,
+) {
+    // Validate packed RHS info
+    debug_assert_eq!(packed_rhs_info.k, k);
+    debug_assert_eq!(packed_rhs_info.n, n);
+    debug_assert_eq!(packed_rhs_info.nr, NR);
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if !read_dst {
+        alpha.set_zero();
+    }
+
+    if k == 0 {
+        // dst = alpha * dst
+        if alpha.is_zero() {
+            for j in 0..n {
+                for i in 0..m {
+                    *dst.offset(i as isize * dst_rs + j as isize * dst_cs) = T::zero();
+                }
+            }
+            return;
+        }
+
+        if alpha.is_one() {
+            return;
+        }
+
+        for j in 0..n {
+            for i in 0..m {
+                let dst = dst.offset(i as isize * dst_rs + j as isize * dst_cs);
+                *dst = alpha * *dst;
+            }
+        }
+        return;
+    }
+
+    // Note: gevv optimization is skipped for prepacked RHS since it expects
+    // unpacked matrix layout, not the panel-packed format used by prepack_rhs.
+    // This is fine since k <= 2 is rare for weight matrices in neural networks.
+
+    let kc = packed_rhs_info.kc;
+
+    // Compute mc based on cache params - use same logic as regular gemm
+    let KernelParams { mc, nc, kc: computed_kc } = kernel_params(m, n, k, MR, NR, core::mem::size_of::<T>());
+
+    // Verify kc matches what was used during packing
+    debug_assert_eq!(computed_kc, kc, "kc mismatch: prepacked buffer was created with different cache parameters");
+
+    let nc = if nc > 0 {
+        nc
+    } else {
+        match parallelism {
+            Parallelism::None => 128 * NR,
+            #[cfg(feature = "rayon")]
+            Parallelism::Rayon(_) => n.msrv_next_multiple_of(NR),
+        }
+    };
+
+    let simd_align = CACHELINE_ALIGN;
+
+    let packed_rhs_stride = kc * NR;
+    let packed_lhs_stride = kc * MR;
+
+    let dst = Ptr(dst);
+    let lhs = Ptr(lhs as *mut T);
+    let packed_rhs = Ptr(packed_rhs as *mut T);
+
+    #[cfg(feature = "rayon")]
+    let max_threads = match parallelism {
+        Parallelism::None => 1,
+        Parallelism::Rayon(n_threads) => {
+            if n_threads == 0 {
+                rayon::current_num_threads()
+            } else {
+                n_threads
+            }
+        }
+    };
+
+    #[cfg(feature = "rayon")]
+    let threading_threshold = {
+        use core::any::TypeId;
+        let is_c32 = TypeId::of::<c32>() == TypeId::of::<T>();
+        let is_c64 = TypeId::of::<c64>() == TypeId::of::<T>();
+        if is_c32 {
+            get_threading_threshold() / 4
+        } else if is_c64 {
+            get_threading_threshold() / 16
+        } else {
+            get_threading_threshold()
+        }
+    };
+
+    let do_prepack_lhs = m <= 2 * mc && ((m % N != 0) || lhs_rs != 1);
+
+    // We don't need rhs packing buffer since it's pre-packed
+    let lhs_req = StackReq::new_aligned::<T>(
+        if do_prepack_lhs {
+            packed_lhs_stride * (m.msrv_next_multiple_of(MR) / MR)
+        } else {
+            0
+        },
+        simd_align,
+    );
+
+    let mut mem = if do_prepack_lhs {
+        Some(dyn_stack::MemBuffer::new(lhs_req))
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "std"))]
+    let mut l2_slab = dyn_stack::MemBuffer::new(StackReq::new_aligned::<T>(
+        packed_lhs_stride * (mc / MR),
+        simd_align,
+    ));
+
+    let prepacked_lhs = mem.as_mut().map(|mem| {
+        let stack = DynStack::new(mem);
+        let (lhs_storage, _) = stack.make_aligned_uninit::<T>(
+            if do_prepack_lhs {
+                packed_lhs_stride * (m.msrv_next_multiple_of(MR) / MR)
+            } else {
+                0
+            },
+            simd_align,
+        );
+        lhs_storage.as_mut_ptr() as *mut T
+    }).unwrap_or(core::ptr::null_mut());
+
+    let prepacked_lhs = Ptr(prepacked_lhs);
+
+    let packed_rhs_rs = NR as isize;
+    let packed_rhs_cs = 1isize;
+
+    let n_panels = n.msrv_div_ceil(NR);
+
+    let mut col_outer = 0;
+    while col_outer != n {
+        let n_chunk = nc.min(n - col_outer);
+
+        let mut alpha = alpha;
+
+        let mut depth_outer = 0;
+        while depth_outer != k {
+            let k_chunk = kc.min(k - depth_outer);
+            let alpha_status = if alpha.is_zero() {
+                0
+            } else if alpha.is_one() {
+                1
+            } else {
+                2
+            };
+
+            let n_threads = match parallelism {
+                Parallelism::None => 1,
+                #[cfg(feature = "rayon")]
+                Parallelism::Rayon(_) => {
+                    let total_work = (m * n_chunk).saturating_mul(k_chunk);
+                    if total_work < threading_threshold {
+                        1
+                    } else {
+                        max_threads
+                    }
+                }
+            };
+
+            let packing_threshold = if n_threads == 1 {
+                get_lhs_packing_threshold_single_thread()
+            } else {
+                get_lhs_packing_threshold_multi_thread()
+            };
+
+            // Calculate offset into pre-packed RHS buffer
+            let k_panel_idx = depth_outer / kc;
+            let col_panel_offset = col_outer / NR;
+            let packed_rhs_base = packed_rhs.wrapping_add(
+                k_panel_idx * n_panels * packed_rhs_stride + col_panel_offset * packed_rhs_stride
+            );
+
+            if do_prepack_lhs {
+                pack_lhs::<T, N, MR, _>(
+                    simd,
+                    m,
+                    k_chunk,
+                    prepacked_lhs,
+                    lhs.wrapping_offset(depth_outer as isize * lhs_cs),
+                    lhs_cs,
+                    lhs_rs,
+                    packed_lhs_stride,
+                );
+            }
+
+            let n_col_mini_chunks = (n_chunk + (NR - 1)) / NR;
+
+            let mut n_jobs = 0;
+            let mut row_outer = 0;
+            while row_outer != m {
+                let mut m_chunk = mc.min(m - row_outer);
+                if m_chunk > N && !do_prepack_lhs {
+                    m_chunk = m_chunk / N * N;
+                }
+                let n_row_mini_chunks = (m_chunk + (MR - 1)) / MR;
+                n_jobs += n_col_mini_chunks * n_row_mini_chunks;
+                row_outer += m_chunk;
+            }
+
+            let func = move |tid, packed_lhs: Ptr<T>| {
+                let min_jobs_per_thread = n_jobs / n_threads;
+                let rem = n_jobs - n_threads * min_jobs_per_thread;
+
+                let (job_start, job_end) = if tid < rem {
+                    let start = tid * (min_jobs_per_thread + 1);
+                    (start, start + min_jobs_per_thread + 1)
+                } else {
+                    let start = tid * min_jobs_per_thread + rem;
+                    (start, start + min_jobs_per_thread)
+                };
+
+                let mut row_outer = 0;
+                let mut job_id = 0;
+                while row_outer != m {
+                    let mut m_chunk = mc.min(m - row_outer);
+                    if m_chunk > N && !do_prepack_lhs {
+                        m_chunk = m_chunk / N * N;
+                    }
+                    let n_row_mini_chunks = (m_chunk + (MR - 1)) / MR;
+
+                    let n_mini_jobs = n_col_mini_chunks * n_row_mini_chunks;
+
+                    if job_id >= job_end {
+                        return;
+                    }
+                    if job_id + n_mini_jobs < job_start {
+                        row_outer += m_chunk;
+                        job_id += n_mini_jobs;
+                        continue;
+                    }
+
+                    let do_pack_lhs = !do_prepack_lhs
+                        && ((m_chunk % N != 0) || lhs_rs != 1 || n_chunk > packing_threshold * NR);
+                    let packed_lhs_cs = if do_prepack_lhs || do_pack_lhs {
+                        MR as isize
+                    } else {
+                        lhs_cs
+                    };
+
+                    let mut j = 0;
+                    let mut local_did_pack = alloc::vec![false; mc / MR];
+                    while j < n_col_mini_chunks {
+                        let mut i = 0;
+                        while i < n_row_mini_chunks {
+                            let col_inner = NR * j;
+                            let n_chunk_inner = NR.min(n_chunk - col_inner);
+
+                            let row_inner = MR * i;
+                            let m_chunk_inner = MR.min(m_chunk - row_inner);
+
+                            if job_id < job_start || job_id >= job_end {
+                                job_id += 1;
+                                i += 1;
+                                continue;
+                            }
+                            job_id += 1;
+
+                            let dst = dst.wrapping_offset(
+                                (row_outer + row_inner) as isize * dst_rs
+                                    + (col_outer + col_inner) as isize * dst_cs,
+                            );
+
+                            let func =
+                                dispatcher[(m_chunk_inner + (N - 1)) / N - 1][n_chunk_inner - 1];
+
+                            if do_pack_lhs && !local_did_pack[i] {
+                                pack_lhs::<T, N, MR, _>(
+                                    simd,
+                                    m_chunk_inner,
+                                    k_chunk,
+                                    packed_lhs.wrapping_add(i * packed_lhs_stride),
+                                    lhs.wrapping_offset(
+                                        (row_outer + row_inner) as isize * lhs_rs
+                                            + depth_outer as isize * lhs_cs,
+                                    ),
+                                    lhs_cs,
+                                    lhs_rs,
+                                    packed_lhs_stride,
+                                );
+                                local_did_pack[i] = true;
+                            }
+
+                            func(
+                                m_chunk_inner,
+                                n_chunk_inner,
+                                k_chunk,
+                                dst.0,
+                                if do_pack_lhs {
+                                    packed_lhs.wrapping_add(i * packed_lhs_stride).0
+                                } else if do_prepack_lhs {
+                                    prepacked_lhs
+                                        .wrapping_add((i + row_outer / MR) * packed_lhs_stride)
+                                        .0
+                                } else {
+                                    lhs.wrapping_offset(
+                                        (row_outer + row_inner) as isize * lhs_rs
+                                            + depth_outer as isize * lhs_cs,
+                                    )
+                                    .0
+                                },
+                                // Use pre-packed RHS with correct offset
+                                packed_rhs_base.wrapping_add(j * packed_rhs_stride).0,
+                                dst_cs,
+                                dst_rs,
+                                packed_lhs_cs,
+                                packed_rhs_rs,
+                                packed_rhs_cs,
+                                alpha,
+                                beta,
+                                alpha_status,
+                                false, // conj_dst
+                                false, // conj_lhs
+                                false, // conj_rhs
+                                core::ptr::null(),
+                            );
+                            i += 1;
+                        }
+                        j += 1;
+                    }
+
+                    row_outer += m_chunk;
+                }
+            };
+
+            if do_prepack_lhs {
+                match parallelism {
+                    Parallelism::None => func(0, prepacked_lhs),
+                    #[cfg(feature = "rayon")]
+                    Parallelism::Rayon(_) => {
+                        if n_threads == 1 {
+                            func(0, prepacked_lhs);
+                        } else {
+                            par_for_each(n_threads, |tid| func(tid, prepacked_lhs));
+                        }
+                    }
+                }
+            } else {
+                #[cfg(feature = "std")]
+                let func = |tid: usize| {
+                    L2_SLAB.with(|mem| {
+                        let mut mem = mem.borrow_mut();
+                        let stack = DynStack::new(&mut mem);
+                        let (packed_lhs_storage, _) = stack
+                            .make_aligned_uninit::<T>(packed_lhs_stride * (mc / MR), simd_align);
+                        let packed_lhs = Ptr(packed_lhs_storage.as_mut_ptr() as *mut T);
+                        func(tid, packed_lhs);
+                    });
+                };
+
+                #[cfg(not(feature = "std"))]
+                let mut func = |tid: usize| {
+                    let stack = DynStack::new(&mut l2_slab);
+                    let (packed_lhs_storage, _) =
+                        stack.make_aligned_uninit::<T>(packed_lhs_stride * (mc / MR), simd_align);
+                    let packed_lhs = Ptr(packed_lhs_storage.as_mut_ptr() as *mut T);
+                    func(tid, packed_lhs);
+                };
+
+                match parallelism {
+                    Parallelism::None => func(0),
+                    #[cfg(feature = "rayon")]
+                    Parallelism::Rayon(_) => {
+                        if n_threads == 1 {
+                            func(0);
+                        } else {
+                            par_for_each(n_threads, func);
+                        }
+                    }
+                }
+            }
+
+            alpha.set_one();
+            depth_outer += k_chunk;
+        }
+        col_outer += n_chunk;
+    }
+}
+
+/// Macro to inject prepacking module into a type-specific GEMM implementation
+#[macro_export]
+macro_rules! __inject_prepack_mod {
+    ($prepack_module: ident, $microkernel_module: ident, $ty: ident, $N: expr, $simd: ident) => {
+        mod $prepack_module {
+            use super::*;
+            use crate::gemm_common::simd::MixedSimd;
+            use crate::microkernel::$microkernel_module::$ty::*;
+            const N: usize = $N;
+
+            #[inline(never)]
+            pub unsafe fn prepack_rhs(
+                info: &$crate::prepack::PackedRhsInfo,
+                dst: *mut $ty,
+                src: *const $ty,
+                src_rs: isize,
+                src_cs: isize,
+            ) {
+                $crate::gemm::prepack_rhs_generic::<_, $ty, N, { NR }>(
+                    <$crate::simd::$simd as MixedSimd<$ty, $ty, $ty, $ty>>::try_new().unwrap(),
+                    info,
+                    dst,
+                    src,
+                    src_rs,
+                    src_cs,
+                );
+            }
+
+            #[inline(never)]
+            pub unsafe fn gemm_prepacked_rhs(
+                m: usize,
+                n: usize,
+                k: usize,
+                dst: *mut $ty,
+                dst_cs: isize,
+                dst_rs: isize,
+                read_dst: bool,
+                lhs: *const $ty,
+                lhs_cs: isize,
+                lhs_rs: isize,
+                packed_rhs: *const $ty,
+                packed_rhs_info: &$crate::prepack::PackedRhsInfo,
+                alpha: $ty,
+                beta: $ty,
+                parallelism: $crate::Parallelism,
+            ) {
+                $crate::gemm::gemm_with_prepacked_rhs_generic::<
+                    _,
+                    $ty,
+                    N,
+                    { MR_DIV_N * N },
+                    { NR },
+                    { MR_DIV_N },
+                >(
+                    <$crate::simd::$simd as MixedSimd<$ty, $ty, $ty, $ty>>::try_new().unwrap(),
+                    m,
+                    n,
+                    k,
+                    dst,
+                    dst_cs,
+                    dst_rs,
+                    read_dst,
+                    lhs,
+                    lhs_cs,
+                    lhs_rs,
+                    packed_rhs,
+                    packed_rhs_info,
+                    alpha,
+                    beta,
+                    |a, b, c| a * b + c,
+                    &UKR,
+                    parallelism,
+                );
+            }
+        }
+    };
+}
+
+/// Macro to define prepacking functions for a specific type
+#[macro_export]
+macro_rules! gemm_prepack_def {
+    ($ty: tt, $multiplier: expr) => {
+        pub mod prepack {
+            use super::*;
+            pub use $crate::prepack::{PackedRhsInfo, packed_rhs_size, packed_rhs_alignment};
+
+            type PrepackRhsFn = unsafe fn(
+                &PackedRhsInfo,
+                *mut T,
+                *const T,
+                isize,
+                isize,
+            );
+
+            type GemmPrepackedRhsFn = unsafe fn(
+                usize,
+                usize,
+                usize,
+                *mut T,
+                isize,
+                isize,
+                bool,
+                *const T,
+                isize,
+                isize,
+                *const T,
+                &PackedRhsInfo,
+                T,
+                T,
+                $crate::Parallelism,
+            );
+
+            #[inline]
+            fn init_prepack_rhs_fn() -> PrepackRhsFn {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    #[cfg(feature = "x86-v4")]
+                    if $crate::feature_detected!("avx512f") {
+                        return prepack_avx512f::prepack_rhs;
+                    }
+                    if $crate::feature_detected!("fma") {
+                        prepack_fma::prepack_rhs
+                    } else {
+                        prepack_scalar::prepack_rhs
+                    }
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if $crate::feature_detected!("neon") {
+                        prepack_neon::prepack_rhs
+                    } else {
+                        prepack_scalar::prepack_rhs
+                    }
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if $crate::feature_detected!("simd128") {
+                        prepack_simd128::prepack_rhs
+                    } else {
+                        prepack_scalar::prepack_rhs
+                    }
+                }
+
+                #[cfg(not(any(
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    target_arch = "aarch64",
+                    target_arch = "wasm32",
+                )))]
+                {
+                    prepack_scalar::prepack_rhs
+                }
+            }
+
+            #[inline]
+            fn init_gemm_prepacked_rhs_fn() -> GemmPrepackedRhsFn {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    #[cfg(feature = "x86-v4")]
+                    if $crate::feature_detected!("avx512f") {
+                        return prepack_avx512f::gemm_prepacked_rhs;
+                    }
+                    if $crate::feature_detected!("fma") {
+                        prepack_fma::gemm_prepacked_rhs
+                    } else {
+                        prepack_scalar::gemm_prepacked_rhs
+                    }
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if $crate::feature_detected!("neon") {
+                        prepack_neon::gemm_prepacked_rhs
+                    } else {
+                        prepack_scalar::gemm_prepacked_rhs
+                    }
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if $crate::feature_detected!("simd128") {
+                        prepack_simd128::gemm_prepacked_rhs
+                    } else {
+                        prepack_scalar::gemm_prepacked_rhs
+                    }
+                }
+
+                #[cfg(not(any(
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    target_arch = "aarch64",
+                    target_arch = "wasm32",
+                )))]
+                {
+                    prepack_scalar::gemm_prepacked_rhs
+                }
+            }
+
+            static PREPACK_RHS_PTR: ::core::sync::atomic::AtomicPtr<()> =
+                ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+            static GEMM_PREPACKED_RHS_PTR: ::core::sync::atomic::AtomicPtr<()> =
+                ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+            #[inline(never)]
+            fn init_prepack_rhs_ptr() -> PrepackRhsFn {
+                let f = init_prepack_rhs_fn();
+                PREPACK_RHS_PTR.store(f as *mut (), ::core::sync::atomic::Ordering::Relaxed);
+                f
+            }
+
+            #[inline(never)]
+            fn init_gemm_prepacked_rhs_ptr() -> GemmPrepackedRhsFn {
+                let f = init_gemm_prepacked_rhs_fn();
+                GEMM_PREPACKED_RHS_PTR.store(f as *mut (), ::core::sync::atomic::Ordering::Relaxed);
+                f
+            }
+
+            #[inline(always)]
+            pub fn get_prepack_rhs_fn() -> PrepackRhsFn {
+                let mut f = PREPACK_RHS_PTR.load(::core::sync::atomic::Ordering::Relaxed);
+                if f.is_null() {
+                    f = init_prepack_rhs_ptr() as *mut ();
+                }
+                unsafe { ::core::mem::transmute(f) }
+            }
+
+            #[inline(always)]
+            pub fn get_gemm_prepacked_rhs_fn() -> GemmPrepackedRhsFn {
+                let mut f = GEMM_PREPACKED_RHS_PTR.load(::core::sync::atomic::Ordering::Relaxed);
+                if f.is_null() {
+                    f = init_gemm_prepacked_rhs_ptr() as *mut ();
+                }
+                unsafe { ::core::mem::transmute(f) }
+            }
+
+            $crate::__inject_prepack_mod!(prepack_scalar, scalar, $ty, 1, Scalar);
+
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            $crate::__inject_prepack_mod!(prepack_fma, fma, $ty, 4 * $multiplier, V3);
+            #[cfg(all(feature = "x86-v4", any(target_arch = "x86", target_arch = "x86_64")))]
+            $crate::__inject_prepack_mod!(prepack_avx512f, avx512f, $ty, 8 * $multiplier, V4);
+
+            #[cfg(target_arch = "aarch64")]
+            $crate::__inject_prepack_mod!(prepack_neon, neon, $ty, 2 * $multiplier, Scalar);
+
+            #[cfg(target_arch = "wasm32")]
+            $crate::__inject_prepack_mod!(prepack_simd128, simd128, $ty, 2 * $multiplier, Scalar);
+        }
+    };
 }
 
 #[macro_export]

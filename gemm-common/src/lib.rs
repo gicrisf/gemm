@@ -26,6 +26,7 @@ pub mod cache;
 pub mod gemm;
 pub mod gemv;
 pub mod gevv;
+pub mod prepack;
 
 pub mod horizontal_microkernel;
 pub mod microkernel;
